@@ -1,0 +1,4 @@
+__pycache__/
+.env*
+*.mp4
+result.json
