@@ -21,6 +21,28 @@ API = "http://127.0.0.1:8188"
 PROCESS = None
 
 
+def valid_model_file(path):
+    """Validate safetensors structure before trusting an existing HF cache entry."""
+    from safetensors import safe_open, SafetensorError
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as model:
+            return bool(list(model.keys()))
+    except (OSError, ValueError, RuntimeError, SafetensorError):
+        return False
+
+
+def download_model(repo, filename, cache, token):
+    print("Checking model cache: " + filename, flush=True)
+    path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=str(cache), token=token)
+    if not valid_model_file(path):
+        print("Incomplete model cache; downloading a fresh copy once: " + filename, flush=True)
+        path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=str(cache), token=token, force_download=True)
+        if not valid_model_file(path):
+            raise RuntimeError("Model is still incomplete after one fresh download: " + filename)
+    print("Model file validated: " + filename + " (" + str(Path(path).stat().st_size) + " bytes)", flush=True)
+    return path
+
+
 def prepare():
     global PROCESS
     if PROCESS is not None and PROCESS.poll() is None:
@@ -35,7 +57,7 @@ def prepare():
     ]
     for repo, filename, category, name in models:
         # No token is passed to the Docker build or saved in a model URL.
-        path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=str(cache), token=token)
+        path = download_model(repo, filename, cache, token)
         dest = ROOT / "models" / category / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.is_symlink():
@@ -70,6 +92,8 @@ def run_graph(graph):
         raise RuntimeError("ComfyUI rejected the workflow: " + response.text[:3000])
     prompt_id = response.json()["prompt_id"]
     deadline = time.monotonic() + 1500
+    report_at = time.monotonic() + 30
+    print("ComfyUI generation started: " + prompt_id, flush=True)
     while time.monotonic() < deadline:
         if PROCESS.poll() is not None:
             raise RuntimeError("ComfyUI stopped during generation; inspect memory usage and worker logs")
@@ -93,6 +117,9 @@ def run_graph(graph):
                             raise RuntimeError("Invalid output artifact path")
                         return path, prompt_id
             raise RuntimeError("Generation ended without an MP4 output")
+        if time.monotonic() >= report_at:
+            print("Waiting for ComfyUI job " + prompt_id + "; result not ready yet", flush=True)
+            report_at = time.monotonic() + 30
         time.sleep(2)
     requests.post(API + "/interrupt", timeout=10).raise_for_status()
     # Avoid picking up another job while the timed-out graph is still executing.
