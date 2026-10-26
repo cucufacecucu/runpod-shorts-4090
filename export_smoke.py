@@ -7,6 +7,45 @@ import time
 import requests
 from workflow import build_workflow
 
+
+# Exercise the exact production cache check and one-retry behavior without network.
+import struct
+import tempfile
+import handler as worker
+with tempfile.TemporaryDirectory() as directory:
+    valid = Path(directory) / 'valid.safetensors'
+    broken = Path(directory) / 'broken.safetensors'
+    header = json.dumps({'test': {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()
+    header += b' ' * ((-len(header)) % 8)
+    valid.write_bytes(struct.pack('<Q', len(header)) + header + struct.pack('<f', 1.0))
+    broken.write_bytes(b'incomplete')
+    assert worker.valid_model_file(valid)
+    assert not worker.valid_model_file(broken)
+    original = worker.hf_hub_download
+    calls = []
+    def fake_download(**kwargs):
+        calls.append(kwargs.get('force_download', False))
+        return str(valid if calls[-1] else broken)
+    worker.hf_hub_download = fake_download
+    try:
+        assert worker.download_model('test/repo', 'model.safetensors', directory, None) == str(valid)
+        assert calls == [False, True], calls
+        calls.clear()
+        def always_broken(**kwargs):
+            calls.append(kwargs.get('force_download', False))
+            return str(broken)
+        worker.hf_hub_download = always_broken
+        try:
+            worker.download_model('test/repo', 'model.safetensors', directory, None)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('Incomplete model must not be accepted after retry')
+        assert calls == [False, True], calls
+    finally:
+        worker.hf_hub_download = original
+print('PASS: incomplete safetensors detected, one retry repairs cache, repeated corruption fails before GPU inference', flush=True)
+
 root = Path('/comfyui')
 audio = root / 'input' / 'export-smoke.wav'
 subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '1', str(audio)], check=True)
