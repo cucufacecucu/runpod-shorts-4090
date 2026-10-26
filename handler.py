@@ -1,5 +1,6 @@
 """RunPod queue worker. No public ComfyUI port and no credentials in requests."""
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ import uuid
 
 import requests
 import runpod
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 from huggingface_hub import hf_hub_download
 
 from workflow import CHECKPOINT, ENCODER, build_workflow, validate_input
@@ -21,24 +24,35 @@ API = "http://127.0.0.1:8188"
 PROCESS = None
 
 
-def valid_model_file(path):
-    """Validate safetensors structure before trusting an existing HF cache entry."""
+EXPECTED_CHECKPOINT_SHA256 = "8ae14327130c6ffdc87705b02c8e7654aa5c6d9a7f28a52d0acc1c30cb0d2932"
+
+
+def valid_model_file(path, expected_sha256=None):
+    """Validate safetensors structure and, for the checkpoint, its published SHA256."""
     from safetensors import safe_open, SafetensorError
     try:
         with safe_open(str(path), framework="pt", device="cpu") as model:
-            return bool(list(model.keys()))
+            if not list(model.keys()):
+                return False
     except (OSError, ValueError, RuntimeError, SafetensorError):
         return False
+    if expected_sha256:
+        with open(path, "rb") as model_file:
+            actual_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
+        if actual_sha256 != expected_sha256:
+            print("Checkpoint SHA256 mismatch; will download a fresh copy", flush=True)
+            return False
+    return True
 
 
-def download_model(repo, filename, cache, token):
+def download_model(repo, filename, cache, token, expected_sha256=None):
     print("Checking model cache: " + filename, flush=True)
     path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=str(cache), token=token)
-    if not valid_model_file(path):
-        print("Incomplete model cache; downloading a fresh copy once: " + filename, flush=True)
+    if not valid_model_file(path, expected_sha256):
+        print("Incomplete or mismatched model cache; downloading a fresh copy once: " + filename, flush=True)
         path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=str(cache), token=token, force_download=True)
-        if not valid_model_file(path):
-            raise RuntimeError("Model is still incomplete after one fresh download: " + filename)
+        if not valid_model_file(path, expected_sha256):
+            raise RuntimeError("Model failed integrity validation after one fresh download: " + filename)
     print("Model file validated: " + filename + " (" + str(Path(path).stat().st_size) + " bytes)", flush=True)
     return path
 
@@ -52,12 +66,12 @@ def prepare():
     cache = VOLUME / "hf-cache"
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_ACCESS_TOKEN")
     models = [
-        ("Lightricks/LTX-2", CHECKPOINT, "checkpoints", CHECKPOINT),
-        ("Comfy-Org/ltx-2", "split_files/text_encoders/" + ENCODER, "text_encoders", ENCODER),
+        ("Lightricks/LTX-2", CHECKPOINT, "checkpoints", CHECKPOINT, EXPECTED_CHECKPOINT_SHA256),
+        ("Comfy-Org/ltx-2", "split_files/text_encoders/" + ENCODER, "text_encoders", ENCODER, None),
     ]
-    for repo, filename, category, name in models:
+    for repo, filename, category, name, expected_sha256 in models:
         # No token is passed to the Docker build or saved in a model URL.
-        path = download_model(repo, filename, cache, token)
+        path = download_model(repo, filename, cache, token, expected_sha256)
         dest = ROOT / "models" / category / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.is_symlink():
