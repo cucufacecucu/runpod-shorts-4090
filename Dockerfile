@@ -14,5 +14,6 @@ RUN pip install -r /comfyui/requirements.txt 'transformers>=4.50.3,<5' 'huggingf
 # Test core imports during the build; model inference still needs a GPU test.
 RUN cd /comfyui && python main.py --quick-test-for-ci --cpu
 WORKDIR /worker
-COPY handler.py workflow.py ./
+COPY handler.py workflow.py export_smoke.py ./
+RUN python export_smoke.py
 CMD ["python", "-u", "handler.py"]
