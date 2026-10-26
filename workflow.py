@@ -37,7 +37,7 @@ def build_workflow(prompt, seed):
         "17": node("LTXVAudioVAEDecode", samples=["15", 1], audio_vae=["6", 0]),
         "18": node("CreateVideo", images=["16", 0], audio=["17", 0], fps=24.0),
         "19": node("SaveVideo", video=["18", 0], filename_prefix="shorts/generated",
-                   format={"format": "mp4", "codec": {"codec": "h264"}}),
+                   format="h264-mp4"),
     }
 
 
