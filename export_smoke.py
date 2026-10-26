@@ -8,7 +8,7 @@ import requests
 from workflow import build_workflow
 
 
-# Exercise the exact production cache check and one-retry behavior without network.
+# Exercise the exact production cache validation, invalidation, and retry without network.
 import struct
 import tempfile
 import handler as worker
@@ -19,8 +19,8 @@ with tempfile.TemporaryDirectory() as directory:
     header += b' ' * ((-len(header)) % 8)
     valid.write_bytes(struct.pack('<Q', len(header)) + header + struct.pack('<f', 1.0))
     broken.write_bytes(b'incomplete')
-    assert worker.valid_model_file(valid)
-    assert not worker.valid_model_file(broken)
+    assert worker.inspect_model_file(valid) == (True, 'size=' + str(valid.stat().st_size) + ' bytes')
+    assert not worker.inspect_model_file(broken)[0]
     original = worker.hf_hub_download
     calls = []
     def fake_download(**kwargs):
@@ -31,6 +31,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert worker.download_model('test/repo', 'model.safetensors', directory, None) == str(valid)
         assert calls == [False, True], calls
         calls.clear()
+        broken.write_bytes(b'incomplete')
         def always_broken(**kwargs):
             calls.append(kwargs.get('force_download', False))
             return str(broken)
@@ -44,7 +45,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert calls == [False, True], calls
     finally:
         worker.hf_hub_download = original
-print('PASS: incomplete safetensors detected, one retry repairs cache, repeated corruption fails before GPU inference', flush=True)
+print('PASS: invalid model cache is deleted, one clean retry repairs it, repeated corruption fails before GPU inference', flush=True)
 
 root = Path('/comfyui')
 audio = root / 'input' / 'export-smoke.wav'
