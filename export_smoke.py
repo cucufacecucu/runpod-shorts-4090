@@ -11,6 +11,7 @@ from workflow import build_workflow
 # Exercise the exact production cache validation, invalidation, and retry without network.
 import struct
 import tempfile
+import hashlib
 import handler as worker
 with tempfile.TemporaryDirectory() as directory:
     valid = Path(directory) / 'valid.safetensors'
@@ -22,14 +23,37 @@ with tempfile.TemporaryDirectory() as directory:
     assert worker.inspect_model_file(valid) == (True, 'size=' + str(valid.stat().st_size) + ' bytes')
     assert not worker.inspect_model_file(broken)[0]
     original = worker.hf_hub_download
+    original_digest = worker.hashlib.file_digest
+    digest_calls = []
+    def tracked_digest(file_obj, algorithm):
+        digest_calls.append(algorithm)
+        return original_digest(file_obj, algorithm)
+    worker.hashlib.file_digest = tracked_digest
+    expected_sha256 = hashlib.sha256(valid.read_bytes()).hexdigest()
+    expected_size = valid.stat().st_size
     calls = []
     def fake_download(**kwargs):
         calls.append(kwargs.get('force_download', False))
         return str(valid if calls[-1] else broken)
     worker.hf_hub_download = fake_download
     try:
-        assert worker.download_model('test/repo', 'model.safetensors', directory, None) == str(valid)
+        assert worker.download_model(
+            'test/repo', 'model.safetensors', directory, None,
+            expected_sha256, expected_size,
+        ) == str(valid)
         assert calls == [False, True], calls
+        assert digest_calls == ['sha256'], digest_calls
+        calls.clear()
+        def cached_download(**kwargs):
+            calls.append(kwargs.get('force_download', False))
+            return str(valid)
+        worker.hf_hub_download = cached_download
+        assert worker.download_model(
+            'test/repo', 'model.safetensors', directory, None,
+            expected_sha256, expected_size,
+        ) == str(valid)
+        assert calls == [False], calls
+        assert digest_calls == ['sha256'], digest_calls
         calls.clear()
         broken.write_bytes(b'incomplete')
         def always_broken(**kwargs):
@@ -45,7 +69,8 @@ with tempfile.TemporaryDirectory() as directory:
         assert calls == [False, True], calls
     finally:
         worker.hf_hub_download = original
-print('PASS: invalid model cache is deleted, one clean retry repairs it, repeated corruption fails before GPU inference', flush=True)
+        worker.hashlib.file_digest = original_digest
+print('PASS: invalid model cache is deleted, one clean retry repairs it, valid cached model SHA is not re-read, repeated corruption fails before GPU inference', flush=True)
 
 root = Path('/comfyui')
 audio = root / 'input' / 'export-smoke.wav'

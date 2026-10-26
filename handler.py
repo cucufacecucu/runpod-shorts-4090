@@ -29,7 +29,7 @@ EXPECTED_CHECKPOINT_SIZE = 27078716346
 CHECKPOINT_REVISION = "7155457d682235792cef26ee984113ac10684e83"
 
 
-def inspect_model_file(path, expected_sha256=None, expected_size=None):
+def inspect_model_file(path, expected_sha256=None, expected_size=None, verify_sha256=True):
     """Return a validation result and useful integrity details for a cached model."""
     path = Path(path)
     try:
@@ -47,7 +47,7 @@ def inspect_model_file(path, expected_sha256=None, expected_size=None):
     except (OSError, ValueError, RuntimeError, SafetensorError):
         return False, f"invalid safetensors structure (size={size} bytes)"
 
-    if expected_sha256:
+    if expected_sha256 and verify_sha256:
         with path.open("rb") as model_file:
             actual_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
         if actual_sha256 != expected_sha256:
@@ -58,7 +58,44 @@ def inspect_model_file(path, expected_sha256=None, expected_size=None):
     return True, f"size={size} bytes"
 
 
-def discard_cached_file(path):
+def verification_marker(cache, expected_sha256):
+    return Path(cache) / "verified" / (expected_sha256 + ".json")
+
+
+def file_fingerprint(path):
+    path = Path(path).resolve()
+    stat = path.stat()
+    return {
+        "path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+        "device": stat.st_dev, "inode": stat.st_ino,
+    }
+
+
+def model_was_verified(path, cache, expected_sha256, expected_size):
+    if not expected_sha256:
+        return False
+    marker = verification_marker(cache, expected_sha256)
+    try:
+        saved = json.loads(marker.read_text())
+        current = file_fingerprint(path)
+        return (
+            saved.get("sha256") == expected_sha256
+            and saved.get("file") == current
+            and current["size"] == expected_size
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def mark_model_verified(path, cache, expected_sha256):
+    marker = verification_marker(cache, expected_sha256)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"sha256": expected_sha256, "file": file_fingerprint(path)}))
+    temporary.replace(marker)
+
+
+def discard_cached_file(path, cache=None, expected_sha256=None):
     """Remove an invalid snapshot link/blob and any interrupted sibling download."""
     path = Path(path)
     resolved = path.resolve(strict=False)
@@ -66,6 +103,8 @@ def discard_cached_file(path):
     if resolved != path:
         resolved.unlink(missing_ok=True)
     resolved.with_name(resolved.name + ".incomplete").unlink(missing_ok=True)
+    if cache is not None and expected_sha256:
+        verification_marker(cache, expected_sha256).unlink(missing_ok=True)
 
 
 def download_model(repo, filename, cache, token, expected_sha256=None, expected_size=None, revision="main"):
@@ -73,18 +112,27 @@ def download_model(repo, filename, cache, token, expected_sha256=None, expected_
     path = hf_hub_download(
         repo_id=repo, filename=filename, revision=revision, cache_dir=str(cache), token=token
     )
-    valid, details = inspect_model_file(path, expected_sha256, expected_size)
+    cached_verified = model_was_verified(path, cache, expected_sha256, expected_size)
+    if expected_sha256 and not cached_verified:
+        print("Verifying model SHA-256 (first-time cache check): " + filename, flush=True)
+    valid, details = inspect_model_file(
+        path, expected_sha256, expected_size, verify_sha256=not cached_verified
+    )
     if not valid:
         print("Invalid cached model (" + details + "); deleting it before a clean download: " + filename, flush=True)
-        discard_cached_file(path)
+        discard_cached_file(path, cache, expected_sha256)
         path = hf_hub_download(
             repo_id=repo, filename=filename, revision=revision, cache_dir=str(cache),
             token=token, force_download=True,
         )
         valid, details = inspect_model_file(path, expected_sha256, expected_size)
         if not valid:
-            discard_cached_file(path)
+            discard_cached_file(path, cache, expected_sha256)
             raise RuntimeError("Fresh model download failed integrity validation: " + filename + "; " + details)
+        if expected_sha256:
+            mark_model_verified(path, cache, expected_sha256)
+    elif expected_sha256 and not cached_verified:
+        mark_model_verified(path, cache, expected_sha256)
     print("Model file validated: " + filename + " (" + details + ")", flush=True)
     return path
 
