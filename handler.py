@@ -25,35 +25,67 @@ PROCESS = None
 
 
 EXPECTED_CHECKPOINT_SHA256 = "8ae14327130c6ffdc87705b02c8e7654aa5c6d9a7f28a52d0acc1c30cb0d2932"
+EXPECTED_CHECKPOINT_SIZE = 27078716346
+CHECKPOINT_REVISION = "7155457d682235792cef26ee984113ac10684e83"
 
 
-def valid_model_file(path, expected_sha256=None):
-    """Validate safetensors structure and, for the checkpoint, its published SHA256."""
+def inspect_model_file(path, expected_sha256=None, expected_size=None):
+    """Return a validation result and useful integrity details for a cached model."""
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return False, f"cannot stat file: {exc}"
+    if expected_size is not None and size != expected_size:
+        return False, f"size mismatch: got {size} bytes, expected {expected_size}"
+
     from safetensors import safe_open, SafetensorError
     try:
         with safe_open(str(path), framework="pt", device="cpu") as model:
             if not list(model.keys()):
-                return False
+                return False, f"safetensors contains no tensors (size={size} bytes)"
     except (OSError, ValueError, RuntimeError, SafetensorError):
-        return False
+        return False, f"invalid safetensors structure (size={size} bytes)"
+
     if expected_sha256:
-        with open(path, "rb") as model_file:
+        with path.open("rb") as model_file:
             actual_sha256 = hashlib.file_digest(model_file, "sha256").hexdigest()
         if actual_sha256 != expected_sha256:
-            print("Checkpoint SHA256 mismatch; will download a fresh copy", flush=True)
-            return False
-    return True
+            return False, (
+                f"SHA256 mismatch: got {actual_sha256}, expected {expected_sha256}; "
+                f"size={size} bytes"
+            )
+    return True, f"size={size} bytes"
 
 
-def download_model(repo, filename, cache, token, expected_sha256=None):
+def discard_cached_file(path):
+    """Remove an invalid snapshot link/blob and any interrupted sibling download."""
+    path = Path(path)
+    resolved = path.resolve(strict=False)
+    path.unlink(missing_ok=True)
+    if resolved != path:
+        resolved.unlink(missing_ok=True)
+    resolved.with_name(resolved.name + ".incomplete").unlink(missing_ok=True)
+
+
+def download_model(repo, filename, cache, token, expected_sha256=None, expected_size=None, revision="main"):
     print("Checking model cache: " + filename, flush=True)
-    path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=str(cache), token=token)
-    if not valid_model_file(path, expected_sha256):
-        print("Incomplete or mismatched model cache; downloading a fresh copy once: " + filename, flush=True)
-        path = hf_hub_download(repo_id=repo, filename=filename, cache_dir=str(cache), token=token, force_download=True)
-        if not valid_model_file(path, expected_sha256):
-            raise RuntimeError("Model failed integrity validation after one fresh download: " + filename)
-    print("Model file validated: " + filename + " (" + str(Path(path).stat().st_size) + " bytes)", flush=True)
+    path = hf_hub_download(
+        repo_id=repo, filename=filename, revision=revision, cache_dir=str(cache), token=token
+    )
+    valid, details = inspect_model_file(path, expected_sha256, expected_size)
+    if not valid:
+        print("Invalid cached model (" + details + "); deleting it before a clean download: " + filename, flush=True)
+        discard_cached_file(path)
+        path = hf_hub_download(
+            repo_id=repo, filename=filename, revision=revision, cache_dir=str(cache),
+            token=token, force_download=True,
+        )
+        valid, details = inspect_model_file(path, expected_sha256, expected_size)
+        if not valid:
+            discard_cached_file(path)
+            raise RuntimeError("Fresh model download failed integrity validation: " + filename + "; " + details)
+    print("Model file validated: " + filename + " (" + details + ")", flush=True)
     return path
 
 
@@ -66,12 +98,14 @@ def prepare():
     cache = VOLUME / "hf-cache"
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_ACCESS_TOKEN")
     models = [
-        ("Lightricks/LTX-2", CHECKPOINT, "checkpoints", CHECKPOINT, EXPECTED_CHECKPOINT_SHA256),
-        ("Comfy-Org/ltx-2", "split_files/text_encoders/" + ENCODER, "text_encoders", ENCODER, None),
+        ("Lightricks/LTX-2", CHECKPOINT, "checkpoints", CHECKPOINT,
+         EXPECTED_CHECKPOINT_SHA256, EXPECTED_CHECKPOINT_SIZE, CHECKPOINT_REVISION),
+        ("Comfy-Org/ltx-2", "split_files/text_encoders/" + ENCODER, "text_encoders",
+         ENCODER, None, None, "main"),
     ]
-    for repo, filename, category, name, expected_sha256 in models:
+    for repo, filename, category, name, expected_sha256, expected_size, revision in models:
         # No token is passed to the Docker build or saved in a model URL.
-        path = download_model(repo, filename, cache, token, expected_sha256)
+        path = download_model(repo, filename, cache, token, expected_sha256, expected_size, revision)
         dest = ROOT / "models" / category / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.is_symlink():
